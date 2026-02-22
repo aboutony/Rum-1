@@ -77,6 +77,7 @@ ${text}
   });
 
   const data = await response.json();
+
   return (data.output || [])
     .flatMap(o => o.content || [])
     .filter(c => c.type === "output_text")
@@ -93,20 +94,30 @@ export default async function handler(req, res) {
 
     const update = req.body;
 
+    // HANDLE DIR COMMAND FIRST (IMPORTANT)
+    if (update.message?.text?.startsWith("DIR=")) {
+      const chatId = update.message.chat.id;
+      const lines = update.message.text.split("\n");
+
+      const dir = lines.find(l => l.startsWith("DIR="))?.replace("DIR=", "").trim();
+      const tone = lines.find(l => l.startsWith("TONE="))?.replace("TONE=", "").trim();
+      const text = global.lastExtractedText || lines.slice(2).join("\n");
+
+      const result = await translate(text, dir, tone);
+
+      await tgCall(token, "sendMessage", {
+        chat_id: chatId,
+        text: result.substring(0, 4000)
+      });
+
+      global.lastExtractedText = null;
+      return res.status(200).json({ ok: true });
+    }
+
     if (update.message) {
       const chatId = update.message.chat.id;
 
-      // TEXT
-      if (update.message.text) {
-        await tgCall(token, "sendMessage", {
-          chat_id: chatId,
-          text:
-            "Reply with:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD\n\nThen paste your text again."
-        });
-        return res.status(200).json({ ok: true });
-      }
-
-      // FILE
+      // FILE HANDLING
       if (update.message.document || update.message.photo) {
         let fileId;
         let mimeType;
@@ -132,37 +143,27 @@ export default async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
+        global.lastExtractedText = extractedText;
+
         await tgCall(token, "sendMessage", {
           chat_id: chatId,
           text:
-            "File received.\n\nNow reply with:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD\n\nThen I will translate it."
+            "File received.\n\nNow reply with:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
         });
-
-        // Store extracted text temporarily in memory (simple approach)
-        global.lastExtractedText = extractedText;
 
         return res.status(200).json({ ok: true });
       }
-    }
 
-    // HANDLE TRANSLATION COMMAND
-    if (update.message?.text?.includes("DIR=")) {
-      const chatId = update.message.chat.id;
-      const lines = update.message.text.split("\n");
+      // TEXT MESSAGE
+      if (update.message.text) {
+        await tgCall(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            "Reply with:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD\n\nThen paste your text."
+        });
 
-      const dir = lines.find(l => l.startsWith("DIR="))?.replace("DIR=", "").trim();
-      const tone = lines.find(l => l.startsWith("TONE="))?.replace("TONE=", "").trim();
-
-      const text = global.lastExtractedText || lines.slice(2).join("\n");
-
-      const result = await translate(text, dir, tone);
-
-      await tgCall(token, "sendMessage", {
-        chat_id: chatId,
-        text: result.substring(0, 4000)
-      });
-
-      return res.status(200).json({ ok: true });
+        return res.status(200).json({ ok: true });
+      }
     }
 
     return res.status(200).json({ ok: true });
