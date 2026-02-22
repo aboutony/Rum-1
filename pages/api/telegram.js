@@ -50,29 +50,63 @@ async function extractText(buffer, mimeType) {
   return null;
 }
 
+async function translate(text, direction, tone) {
+  const apiKey = mustGetEnv("OPENAI_API_KEY");
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      input: `
+System: Greek Orthodox Religious Translation Specialist.
+
+Direction: ${direction}
+Tone: ${tone}
+
+Translate strictly according to Orthodox doctrine.
+Output only translation.
+
+Text:
+${text}
+`
+    })
+  });
+
+  const data = await response.json();
+  return (data.output || [])
+    .flatMap(o => o.content || [])
+    .filter(c => c.type === "output_text")
+    .map(c => c.text)
+    .join("\n")
+    .trim();
+}
+
 export default async function handler(req, res) {
   try {
     const token = mustGetEnv("TELEGRAM_BOT_TOKEN");
 
-    if (req.method !== "POST") {
-      return res.status(200).send("OK");
-    }
+    if (req.method !== "POST") return res.status(200).send("OK");
 
     const update = req.body;
 
     if (update.message) {
       const chatId = update.message.chat.id;
 
-      // TEXT MESSAGE
+      // TEXT
       if (update.message.text) {
         await tgCall(token, "sendMessage", {
           chat_id: chatId,
-          text: "Text received.\nUse direction buttons to translate."
+          text:
+            "Reply with:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD\n\nThen paste your text again."
         });
         return res.status(200).json({ ok: true });
       }
 
-      // DOCUMENT OR IMAGE
+      // FILE
       if (update.message.document || update.message.photo) {
         let fileId;
         let mimeType;
@@ -101,15 +135,38 @@ export default async function handler(req, res) {
         await tgCall(token, "sendMessage", {
           chat_id: chatId,
           text:
-            "File processed successfully.\n\nExtracted text preview:\n\n" +
-            extractedText.substring(0, 1000)
+            "File received.\n\nNow reply with:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD\n\nThen I will translate it."
         });
+
+        // Store extracted text temporarily in memory (simple approach)
+        global.lastExtractedText = extractedText;
 
         return res.status(200).json({ ok: true });
       }
     }
 
+    // HANDLE TRANSLATION COMMAND
+    if (update.message?.text?.includes("DIR=")) {
+      const chatId = update.message.chat.id;
+      const lines = update.message.text.split("\n");
+
+      const dir = lines.find(l => l.startsWith("DIR="))?.replace("DIR=", "").trim();
+      const tone = lines.find(l => l.startsWith("TONE="))?.replace("TONE=", "").trim();
+
+      const text = global.lastExtractedText || lines.slice(2).join("\n");
+
+      const result = await translate(text, dir, tone);
+
+      await tgCall(token, "sendMessage", {
+        chat_id: chatId,
+        text: result.substring(0, 4000)
+      });
+
+      return res.status(200).json({ ok: true });
+    }
+
     return res.status(200).json({ ok: true });
+
   } catch (e) {
     console.error(e);
     return res.status(200).json({ ok: true });
