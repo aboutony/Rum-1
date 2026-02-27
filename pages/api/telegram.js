@@ -270,6 +270,17 @@ export default async function handler(req, res) {
     await redis.expire(dedupeKey, 60 * 10);
 
     const text = (update.message?.text || "").trim();
+    console.log("RUM-1 DEBUG: incoming text =", text);
+
+if (text.toLowerCase() === "ping") {
+  console.log("RUM-1 DEBUG: ping received, replying...");
+  const r = await tgCall(token, "sendMessage", {
+    chat_id: chatId,
+    text: "Rum-1 is alive ✅ (ping reply)"
+  });
+  console.log("RUM-1 DEBUG: sendMessage result =", JSON.stringify(r));
+  return;
+}
 
     // ---- Always reply to /start and ping (so you know it’s alive) ----
     if (text === "/start" || text.toLowerCase() === "ping") {
