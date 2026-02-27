@@ -121,8 +121,8 @@ async function openaiTranslate({ text, direction, tone, allowOverride }) {
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   const enforcement = allowOverride
-    ? `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nTranslate anyway. Do NOT output "${SCOPE_ERROR}". Output only translation.`
-    : `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nIf non-Orthodox scope, output exactly: ${SCOPE_ERROR}\nOutput only translation otherwise.`;
+    ? `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nTranslate anyway. Do NOT output "${SCOPE_ERROR}". Output only the translation.`
+    : `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nIf content is NOT Greek Orthodox religious text, output exactly:\n${SCOPE_ERROR}\nOtherwise output only the translation.`;
 
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -186,7 +186,7 @@ async function translateWithProceedFlow({ chatId, token, direction, tone }) {
     await tgCall(token, "sendMessage", {
       chat_id: chatId,
       text:
-        "Rum-1 detected potential scope mismatch.\n\nProceed = translate anyway.\nOverwrite = discard and upload/paste new content.",
+        "Rum-1 flagged a possible scope mismatch.\n\nProceed = translate anyway.\nOverwrite = discard and upload/paste new content.",
       reply_markup: overrideKeyboard()
     });
     return;
@@ -196,7 +196,7 @@ async function translateWithProceedFlow({ chatId, token, direction, tone }) {
 }
 
 export default async function handler(req, res) {
-  // Always answer Telegram immediately to avoid retries/timeouts
+  // Reply immediately to Telegram (prevents timeouts + retries)
   if (req.method !== "POST") return res.status(200).send("OK");
   res.status(200).json({ ok: true });
 
@@ -204,9 +204,8 @@ export default async function handler(req, res) {
 
   (async () => {
     const update = req.body || {};
-    await tgCall(token, "sendMessage", { chat_id: (update?.message?.chat?.id || update?.callback_query?.message?.chat?.id), text: "Rum-1 is alive ✅" });
 
-    // Handle button clicks
+    // ---- Buttons (Proceed / Overwrite) ----
     if (update.callback_query) {
       const cq = update.callback_query;
       const chatId = cq?.message?.chat?.id;
@@ -217,6 +216,7 @@ export default async function handler(req, res) {
       if (cq.data === "OVR:OVERWRITE") {
         await redis.del(`rum1:lastText:${chatId}`);
         await redis.del(`rum1:pending:${chatId}`);
+
         await tgCall(token, "sendMessage", {
           chat_id: chatId,
           text: "Overwritten. Upload/paste new content."
@@ -237,6 +237,7 @@ export default async function handler(req, res) {
         }
 
         const pending = JSON.parse(raw);
+
         await tgCall(token, "sendMessage", {
           chat_id: chatId,
           text: "Proceeding. Translating anyway..."
@@ -260,7 +261,7 @@ export default async function handler(req, res) {
     const chatId = update?.message?.chat?.id;
     if (!chatId) return;
 
-    // Dedup per chat (prevents repeats on retries)
+    // ---- Dedup per chat (stops Telegram retry repeats) ----
     const updateId = update.update_id;
     const dedupeKey = `rum1:lastUpdate:${chatId}`;
     const last = await redis.get(dedupeKey);
@@ -268,9 +269,21 @@ export default async function handler(req, res) {
     await redis.set(dedupeKey, String(updateId));
     await redis.expire(dedupeKey, 60 * 10);
 
-    // DIR/TONE
-    if (update.message?.text?.trim()?.startsWith("DIR=")) {
-      const { direction, tone } = parseDirTone(update.message.text);
+    const text = (update.message?.text || "").trim();
+
+    // ---- Always reply to /start and ping (so you know it’s alive) ----
+    if (text === "/start" || text.toLowerCase() === "ping") {
+      await tgCall(token, "sendMessage", {
+        chat_id: chatId,
+        text:
+          "Rum-1 is alive ✅\n\nUpload a PDF/DOCX/image, then send:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
+      });
+      return;
+    }
+
+    // ---- DIR/TONE ----
+    if (text.startsWith("DIR=")) {
+      const { direction, tone } = parseDirTone(text);
 
       if (!direction) {
         await tgCall(token, "sendMessage", {
@@ -284,7 +297,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    // File upload
+    // ---- File upload ----
     if (update.message?.document || update.message?.photo) {
       let fileId = "";
       let mimeType = "";
@@ -326,9 +339,8 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Plain text paste
-    if (update.message?.text) {
-      const text = update.message.text.trim();
+    // ---- Plain text paste ----
+    if (text) {
       const key = `rum1:lastText:${chatId}`;
       await redis.set(key, text);
       await redis.expire(key, 60 * 60 * 2);
