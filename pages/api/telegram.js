@@ -196,116 +196,97 @@ async function translateWithProceedFlow({ chatId, token, direction, tone }) {
 }
 
 export default async function handler(req, res) {
-  // Reply immediately to Telegram (prevents timeouts + retries)
-  if (req.method !== "POST") return res.status(200).send("OK");
-  res.status(200).json({ ok: true });
+  try {
+    if (req.method !== "POST") {
+      return res.status(200).send("OK");
+    }
 
-  const token = process.env.TELEGRAM_BOT_TOKEN;
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    if (!token) {
+      return res.status(200).json({ ok: true });
+    }
 
-  (async () => {
     const update = req.body || {};
 
     // ---- Buttons (Proceed / Overwrite) ----
     if (update.callback_query) {
       const cq = update.callback_query;
       const chatId = cq?.message?.chat?.id;
-      if (!chatId) return;
+      if (chatId) {
+        await tgCall(token, "answerCallbackQuery", { callback_query_id: cq.id });
 
-      await tgCall(token, "answerCallbackQuery", { callback_query_id: cq.id });
-
-      if (cq.data === "OVR:OVERWRITE") {
-        await redis.del(`rum1:lastText:${chatId}`);
-        await redis.del(`rum1:pending:${chatId}`);
-
-        await tgCall(token, "sendMessage", {
-          chat_id: chatId,
-          text: "Overwritten. Upload/paste new content."
-        });
-        return;
-      }
-
-      if (cq.data === "OVR:PROCEED") {
-        const pendingKey = `rum1:pending:${chatId}`;
-        const raw = await redis.get(pendingKey);
-
-        if (!raw) {
+        if (cq.data === "OVR:OVERWRITE") {
+          await redis.del(`rum1:lastText:${chatId}`);
+          await redis.del(`rum1:pending:${chatId}`);
           await tgCall(token, "sendMessage", {
             chat_id: chatId,
-            text: "No pending text found. Upload/paste again."
+            text: "Overwritten. Upload/paste new content."
           });
-          return;
         }
 
-        const pending = JSON.parse(raw);
+        if (cq.data === "OVR:PROCEED") {
+          const pendingKey = `rum1:pending:${chatId}`;
+          const raw = await redis.get(pendingKey);
 
-        await tgCall(token, "sendMessage", {
-          chat_id: chatId,
-          text: "Proceeding. Translating anyway..."
-        });
+          if (!raw) {
+            await tgCall(token, "sendMessage", {
+              chat_id: chatId,
+              text: "No pending text found. Upload/paste again."
+            });
+          } else {
+            const pending = JSON.parse(raw);
 
-        const result = await openaiTranslate({
-          text: pending.text,
-          direction: pending.direction || "EN2AR",
-          tone: pending.tone || "AUTO",
-          allowOverride: true
-        });
+            await tgCall(token, "sendMessage", {
+              chat_id: chatId,
+              text: "Proceeding. Translating anyway..."
+            });
 
-        await sendLongMessage(token, chatId, result);
-        await redis.del(pendingKey);
-        return;
+            const result = await openaiTranslate({
+              text: pending.text,
+              direction: pending.direction || "EN2AR",
+              tone: pending.tone || "AUTO",
+              allowOverride: true
+            });
+
+            await sendLongMessage(token, chatId, result);
+            await redis.del(pendingKey);
+          }
+        }
       }
 
-      return;
+      return res.status(200).json({ ok: true });
     }
 
     const chatId = update?.message?.chat?.id;
-    if (!chatId) return;
+    if (!chatId) return res.status(200).json({ ok: true });
 
-    // ---- Dedup per chat (stops Telegram retry repeats) ----
+    // ---- Dedup (prevents repeats) ----
     const updateId = update.update_id;
     const dedupeKey = `rum1:lastUpdate:${chatId}`;
     const last = await redis.get(dedupeKey);
-    if (last && String(last) === String(updateId)) return;
+    if (last && String(last) === String(updateId)) {
+      return res.status(200).json({ ok: true });
+    }
     await redis.set(dedupeKey, String(updateId));
     await redis.expire(dedupeKey, 60 * 10);
 
     const text = (update.message?.text || "").trim();
-    console.log("RUM-1 DEBUG: incoming text =", text);
 
-if (text.toLowerCase() === "ping") {
-  console.log("RUM-1 DEBUG: ping received, replying...");
-  const r = await tgCall(token, "sendMessage", {
-    chat_id: chatId,
-    text: "Rum-1 is alive ✅ (ping reply)"
-  });
-  console.log("RUM-1 DEBUG: sendMessage result =", JSON.stringify(r));
-  return;
-}
-
-    // ---- Always reply to /start and ping (so you know it’s alive) ----
-    if (text === "/start" || text.toLowerCase() === "ping") {
+    // ---- Always respond to ping and /start ----
+    if (text.toLowerCase() === "ping" || text === "/start") {
       await tgCall(token, "sendMessage", {
         chat_id: chatId,
         text:
           "Rum-1 is alive ✅\n\nUpload a PDF/DOCX/image, then send:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
       });
-      return;
+      return res.status(200).json({ ok: true });
     }
 
     // ---- DIR/TONE ----
     if (text.startsWith("DIR=")) {
       const { direction, tone } = parseDirTone(text);
-
-      if (!direction) {
-        await tgCall(token, "sendMessage", {
-          chat_id: chatId,
-          text: "Error: Translation direction not specified."
-        });
-        return;
-      }
-
       await translateWithProceedFlow({ chatId, token, direction, tone });
-      return;
+      return res.status(200).json({ ok: true });
     }
 
     // ---- File upload ----
@@ -335,7 +316,7 @@ if (text.toLowerCase() === "ping") {
           chat_id: chatId,
           text: "I could not extract readable text from this file."
         });
-        return;
+        return res.status(200).json({ ok: true });
       }
 
       const key = `rum1:lastText:${chatId}`;
@@ -347,7 +328,8 @@ if (text.toLowerCase() === "ping") {
         text:
           "Text extracted and saved.\n\nNow send ONLY:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
       });
-      return;
+
+      return res.status(200).json({ ok: true });
     }
 
     // ---- Plain text paste ----
@@ -362,5 +344,23 @@ if (text.toLowerCase() === "ping") {
           "Text received and saved.\n\nNow send ONLY:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
       });
     }
-  })().catch(err => console.error("Worker error:", err));
+
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    // Never break the webhook; always return 200
+    try {
+      const token = process.env.TELEGRAM_BOT_TOKEN;
+      const update = req.body || {};
+      const chatId =
+        update?.message?.chat?.id || update?.callback_query?.message?.chat?.id;
+      if (token && chatId) {
+        await tgCall(token, "sendMessage", {
+          chat_id: chatId,
+          text: "Rum-1 error (debug):\n" + String(err?.message || err).slice(0, 3500)
+        });
+      }
+    } catch (_) {}
+
+    return res.status(200).json({ ok: true });
+  }
 }
