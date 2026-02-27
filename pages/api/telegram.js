@@ -168,6 +168,71 @@ async function translateWithProceedFlow({ chatId, token, direction, tone }) {
 
   await tgCall(token, "sendMessage", { chat_id: chatId, text: "Translating..." });
 
+  // Step A: Ask the model to classify quickly (Orthodox / uncertain / non-religious)
+  const apiKey = mustGetEnv("OPENAI_API_KEY");
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  const classifyResp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model,
+      input: [
+        {
+          role: "system",
+          content:
+            "You are a strict classifier. Return ONLY one label: ORTHODOX, UNCERTAIN, or OUT_OF_SCOPE."
+        },
+        {
+          role: "user",
+          content:
+            "Classify the following text for a Greek Orthodox theological translator:\n\n" +
+            lastText.slice(0, 8000)
+        }
+      ],
+      temperature: 0
+    })
+  });
+
+  const classifyData = await classifyResp.json();
+  if (!classifyResp.ok) throw new Error(JSON.stringify(classifyData));
+
+  const label = (classifyData.output || [])
+    .flatMap(o => o.content || [])
+    .filter(c => c.type === "output_text")
+    .map(c => c.text)
+    .join("\n")
+    .trim()
+    .toUpperCase();
+
+  // If clearly not religious: refuse
+  if (label.includes("OUT_OF_SCOPE")) {
+    await tgCall(token, "sendMessage", { chat_id: chatId, text: SCOPE_ERROR });
+    return;
+  }
+
+  // If uncertain: ask you Proceed/Overwrite (your requirement)
+  if (label.includes("UNCERTAIN")) {
+    const pendingKey = `rum1:pending:${chatId}`;
+    await redis.set(
+      pendingKey,
+      JSON.stringify({ direction, tone: tone || "AUTO", text: lastText })
+    );
+    await redis.expire(pendingKey, 60 * 30);
+
+    await tgCall(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "Rum-1 is not fully sure this text is strictly Greek Orthodox in scope.\n\nProceed = translate anyway.\nOverwrite = discard and upload/paste new content.",
+      reply_markup: overrideKeyboard()
+    });
+    return;
+  }
+
+  // Step B: Normal translation (ORTHODOX)
   const result = await openaiTranslate({
     text: lastText,
     direction,
@@ -175,6 +240,7 @@ async function translateWithProceedFlow({ chatId, token, direction, tone }) {
     allowOverride: false
   });
 
+  // If the model still refuses, fall back to Proceed/Overwrite
   if (result.trim() === SCOPE_ERROR) {
     const pendingKey = `rum1:pending:${chatId}`;
     await redis.set(
@@ -193,174 +259,4 @@ async function translateWithProceedFlow({ chatId, token, direction, tone }) {
   }
 
   await sendLongMessage(token, chatId, result);
-}
-
-export default async function handler(req, res) {
-  try {
-    if (req.method !== "POST") {
-      return res.status(200).send("OK");
-    }
-
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    if (!token) {
-      return res.status(200).json({ ok: true });
-    }
-
-    const update = req.body || {};
-
-    // ---- Buttons (Proceed / Overwrite) ----
-    if (update.callback_query) {
-      const cq = update.callback_query;
-      const chatId = cq?.message?.chat?.id;
-      if (chatId) {
-        await tgCall(token, "answerCallbackQuery", { callback_query_id: cq.id });
-
-        if (cq.data === "OVR:OVERWRITE") {
-          await redis.del(`rum1:lastText:${chatId}`);
-          await redis.del(`rum1:pending:${chatId}`);
-          await tgCall(token, "sendMessage", {
-            chat_id: chatId,
-            text: "Overwritten. Upload/paste new content."
-          });
-        }
-
-        if (cq.data === "OVR:PROCEED") {
-          const pendingKey = `rum1:pending:${chatId}`;
-          const raw = await redis.get(pendingKey);
-
-          if (!raw) {
-            await tgCall(token, "sendMessage", {
-              chat_id: chatId,
-              text: "No pending text found. Upload/paste again."
-            });
-          } else {
-            const pending = JSON.parse(raw);
-
-            await tgCall(token, "sendMessage", {
-              chat_id: chatId,
-              text: "Proceeding. Translating anyway..."
-            });
-
-            const result = await openaiTranslate({
-              text: pending.text,
-              direction: pending.direction || "EN2AR",
-              tone: pending.tone || "AUTO",
-              allowOverride: true
-            });
-
-            await sendLongMessage(token, chatId, result);
-            await redis.del(pendingKey);
-          }
-        }
-      }
-
-      return res.status(200).json({ ok: true });
-    }
-
-    const chatId = update?.message?.chat?.id;
-    if (!chatId) return res.status(200).json({ ok: true });
-
-    // ---- Dedup (prevents repeats) ----
-    const updateId = update.update_id;
-    const dedupeKey = `rum1:lastUpdate:${chatId}`;
-    const last = await redis.get(dedupeKey);
-    if (last && String(last) === String(updateId)) {
-      return res.status(200).json({ ok: true });
-    }
-    await redis.set(dedupeKey, String(updateId));
-    await redis.expire(dedupeKey, 60 * 10);
-
-    const text = (update.message?.text || "").trim();
-
-    // ---- Always respond to ping and /start ----
-    if (text.toLowerCase() === "ping" || text === "/start") {
-      await tgCall(token, "sendMessage", {
-        chat_id: chatId,
-        text:
-          "Rum-1 is alive ✅\n\nUpload a PDF/DOCX/image, then send:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
-      });
-      return res.status(200).json({ ok: true });
-    }
-
-    // ---- DIR/TONE ----
-    if (text.startsWith("DIR=")) {
-      const { direction, tone } = parseDirTone(text);
-      await translateWithProceedFlow({ chatId, token, direction, tone });
-      return res.status(200).json({ ok: true });
-    }
-
-    // ---- File upload ----
-    if (update.message?.document || update.message?.photo) {
-      let fileId = "";
-      let mimeType = "";
-
-      if (update.message.document) {
-        fileId = update.message.document.file_id;
-        mimeType = update.message.document.mime_type || "";
-      } else {
-        fileId = update.message.photo[update.message.photo.length - 1].file_id;
-        mimeType = "image/jpeg";
-      }
-
-      await tgCall(token, "sendMessage", {
-        chat_id: chatId,
-        text: "File received. Extracting text..."
-      });
-
-      const buffer = await downloadFile(fileId, token);
-      const extractedText = await extractText(buffer, mimeType);
-      const cleaned = String(extractedText || "").trim();
-
-      if (!cleaned) {
-        await tgCall(token, "sendMessage", {
-          chat_id: chatId,
-          text: "I could not extract readable text from this file."
-        });
-        return res.status(200).json({ ok: true });
-      }
-
-      const key = `rum1:lastText:${chatId}`;
-      await redis.set(key, cleaned);
-      await redis.expire(key, 60 * 60 * 2);
-
-      await tgCall(token, "sendMessage", {
-        chat_id: chatId,
-        text:
-          "Text extracted and saved.\n\nNow send ONLY:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
-      });
-
-      return res.status(200).json({ ok: true });
-    }
-
-    // ---- Plain text paste ----
-    if (text) {
-      const key = `rum1:lastText:${chatId}`;
-      await redis.set(key, text);
-      await redis.expire(key, 60 * 60 * 2);
-
-      await tgCall(token, "sendMessage", {
-        chat_id: chatId,
-        text:
-          "Text received and saved.\n\nNow send ONLY:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
-      });
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    // Never break the webhook; always return 200
-    try {
-      const token = process.env.TELEGRAM_BOT_TOKEN;
-      const update = req.body || {};
-      const chatId =
-        update?.message?.chat?.id || update?.callback_query?.message?.chat?.id;
-      if (token && chatId) {
-        await tgCall(token, "sendMessage", {
-          chat_id: chatId,
-          text: "Rum-1 error (debug):\n" + String(err?.message || err).slice(0, 3500)
-        });
-      }
-    } catch (_) {}
-
-    return res.status(200).json({ ok: true });
-  }
 }
