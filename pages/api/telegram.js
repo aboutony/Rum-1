@@ -6,7 +6,7 @@ const { Redis } = require("@upstash/redis");
 const TELEGRAM_API = "https://api.telegram.org";
 const redis = Redis.fromEnv();
 
-// IMPORTANT: allow bigger payloads safely
+// Allow bigger payloads safely
 export const config = {
   api: {
     bodyParser: {
@@ -85,12 +85,22 @@ function parseDirTone(messageText) {
   return { direction, tone };
 }
 
-async function translate(text, direction, tone) {
-  const apiKey = mustGetEnv("OPENAI_API_KEY");
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+function overrideKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Proceed", callback_data: "OVR:PROCEED" },
+        { text: "Overwrite", callback_data: "OVR:OVERWRITE" }
+      ]
+    ]
+  };
+}
 
-  // Your mandatory system prompt (as-is)
-  const SYSTEM_PROMPT = `System Prompt: Greek Orthodox Religious Translation Specialist
+const SCOPE_ERROR =
+  "Error: Input falls outside the scope of Greek Orthodox religious texts.";
+
+function buildSystemPrompt() {
+  return `System Prompt: Greek Orthodox Religious Translation Specialist
 ROLE DEFINITION: You are an expert theological translator specializing exclusively in the doctrines, liturgy, and literature of the Greek Orthodox Church. Your sole function is to translate religious texts from English and Greek into Arabic, and vise versa. You possess deep knowledge of Patristics, Byzantine theology, liturgical rubrics, and the specific Arabic terminology used by the Antiochian and broader Greek Orthodox traditions.
 CORE DIRECTIVES (NON-NEGOTIABLE):
 1. Doctrinal Fidelity: Every translation must align 100% with the dogma, spirit, and tradition of the Greek Orthodox Church. Any interpretation that leans toward Protestant, Catholic, secular, or modernist theological frameworks is strictly forbidden.
@@ -113,13 +123,29 @@ EXECUTION PROTOCOL: Upon receiving text:
 3. Construct the sentence structure to reflect the gravity and rhythm of Orthodox Arabic literature.
 4. Review against the "Core Directives" one final time before outputting.
 BEGIN TRANSLATION TASK NOW. Await user input.`;
+}
 
-  const ENFORCEMENT = `Direction is mandatory: ${direction}
+async function openaiResponses({ text, direction, tone, allowOverride }) {
+  const apiKey = mustGetEnv("OPENAI_API_KEY");
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  const enforcement = allowOverride
+    ? `Direction is mandatory: ${direction}
 Tone preference: ${tone || "AUTO"}
 
 MANDATORY:
 - Translate headings/titles too.
 - Output ONLY the translation. No explanations.
+- Do NOT refuse with scope error. Translate anyway, but keep the Orthodox lexicon and tone.
+`
+    : `Direction is mandatory: ${direction}
+Tone preference: ${tone || "AUTO"}
+
+MANDATORY:
+- Translate headings/titles too.
+- Output ONLY the translation. No explanations.
+- If content is not Greek Orthodox religious text, output exactly:
+${SCOPE_ERROR}
 - If direction is missing, output exactly:
 Error: Translation direction not specified.
 `;
@@ -133,8 +159,8 @@ Error: Translation direction not specified.
     body: JSON.stringify({
       model,
       input: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "system", content: ENFORCEMENT },
+        { role: "system", content: buildSystemPrompt() },
+        { role: "system", content: enforcement },
         { role: "user", content: text }
       ],
       temperature: 0.2
@@ -154,111 +180,213 @@ Error: Translation direction not specified.
   return out || "Error: Empty output.";
 }
 
+async function translateWithFallback({ chatId, token, direction, tone }) {
+  const textKey = `rum1:lastText:${chatId}`;
+  const lastText = (await redis.get(textKey)) || "";
+
+  if (!lastText) {
+    await tgCall(token, "sendMessage", {
+      chat_id: chatId,
+      text: "Please upload a PDF/DOCX/image OR paste the text first."
+    });
+    return;
+  }
+
+  await tgCall(token, "sendMessage", { chat_id: chatId, text: "Translating..." });
+
+  const result = await openaiResponses({
+    text: lastText,
+    direction,
+    tone,
+    allowOverride: false
+  });
+
+  // If scope error happens, ask user Proceed/Overwrite, and keep pending state
+  if (result.trim() === SCOPE_ERROR) {
+    const pendingKey = `rum1:pending:${chatId}`;
+    await redis.set(
+      pendingKey,
+      JSON.stringify({
+        direction: direction || "",
+        tone: tone || "AUTO",
+        // store the text snapshot used for that request
+        text: lastText
+      })
+    );
+    await redis.expire(pendingKey, 60 * 30); // 30 minutes
+
+    await tgCall(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "Rum-1 detected that the content may fall outside the strict Greek Orthodox scope.\n\nChoose one:\nProceed = translate anyway.\nOverwrite = discard and upload/paste a new text.",
+      reply_markup: overrideKeyboard()
+    });
+    return;
+  }
+
+  await sendLongMessage(token, chatId, result);
+}
+
 export default async function handler(req, res) {
-  // CRITICAL: Always respond 200 quickly to avoid Telegram webhook errors
+  // Always return quickly to avoid Telegram timeout retries
   if (req.method !== "POST") return res.status(200).send("OK");
 
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+
   try {
-    const token = mustGetEnv("TELEGRAM_BOT_TOKEN");
-    const update = req.body;
+    const update = req.body || {};
+    res.status(200).json({ ok: true }); // respond immediately
 
-    const chatId = update?.message?.chat?.id;
-    if (!chatId) return res.status(200).json({ ok: true });
+    (async () => {
+      // --- Handle button clicks (callback_query) ---
+      if (update.callback_query) {
+        const cq = update.callback_query;
+        const chatId = cq?.message?.chat?.id;
+        if (!chatId) return;
 
-    // 1) DIR/TONE message
-    if (update.message?.text?.trim()?.startsWith("DIR=")) {
-      const { direction, tone } = parseDirTone(update.message.text);
+        // Acknowledge click
+        await tgCall(token, "answerCallbackQuery", { callback_query_id: cq.id });
 
-      if (!direction) {
+        const data = String(cq.data || "");
+
+        if (data === "OVR:OVERWRITE") {
+          await redis.del(`rum1:lastText:${chatId}`);
+          await redis.del(`rum1:pending:${chatId}`);
+
+          await tgCall(token, "sendMessage", {
+            chat_id: chatId,
+            text: "Overwritten. Upload a new PDF/DOCX/image or paste new text."
+          });
+          return;
+        }
+
+        if (data === "OVR:PROCEED") {
+          const pendingKey = `rum1:pending:${chatId}`;
+          const raw = await redis.get(pendingKey);
+          if (!raw) {
+            await tgCall(token, "sendMessage", {
+              chat_id: chatId,
+              text: "No pending text found. Please upload/paste the text again."
+            });
+            return;
+          }
+
+          const pending = JSON.parse(raw);
+          const direction = pending.direction || "EN2AR";
+          const tone = pending.tone || "AUTO";
+          const text = pending.text || "";
+
+          await tgCall(token, "sendMessage", {
+            chat_id: chatId,
+            text: "Proceeding. Translating anyway..."
+          });
+
+          const result = await openaiResponses({
+            text,
+            direction,
+            tone,
+            allowOverride: true
+          });
+
+          await sendLongMessage(token, chatId, result);
+
+          await redis.del(pendingKey);
+          return;
+        }
+
+        return;
+      }
+
+      // --- Handle normal messages ---
+      const chatId = update?.message?.chat?.id;
+      if (!chatId) return;
+
+      // Dedup retries per chat
+      const updateId = update.update_id;
+      const dedupeKey = `rum1:lastUpdate:${chatId}`;
+      const lastUpdateId = await redis.get(dedupeKey);
+      if (lastUpdateId && String(lastUpdateId) === String(updateId)) return;
+      await redis.set(dedupeKey, String(updateId));
+      await redis.expire(dedupeKey, 60 * 10);
+
+      // DIR/TONE message
+      if (update.message?.text?.trim()?.startsWith("DIR=")) {
+        const { direction, tone } = parseDirTone(update.message.text);
+
+        if (!direction) {
+          await tgCall(token, "sendMessage", {
+            chat_id: chatId,
+            text: "Error: Translation direction not specified."
+          });
+          return;
+        }
+
+        await translateWithFallback({ chatId, token, direction, tone });
+        return;
+      }
+
+      // File upload (PDF/DOCX/Image)
+      if (update.message?.document || update.message?.photo) {
+        let fileId = "";
+        let mimeType = "";
+
+        if (update.message.document) {
+          fileId = update.message.document.file_id;
+          mimeType = update.message.document.mime_type || "";
+        } else {
+          fileId = update.message.photo[update.message.photo.length - 1].file_id;
+          mimeType = "image/jpeg";
+        }
+
         await tgCall(token, "sendMessage", {
           chat_id: chatId,
-          text: "Error: Translation direction not specified."
+          text: "File received. Extracting text..."
         });
-        return res.status(200).json({ ok: true });
-      }
 
-      const key = `rum1:lastText:${chatId}`;
-      const textToTranslate = (await redis.get(key)) || "";
+        const buffer = await downloadFile(fileId, token);
+        const extractedText = await extractText(buffer, mimeType);
+        const cleaned = String(extractedText || "").trim();
 
-      if (!textToTranslate) {
+        if (!cleaned) {
+          await tgCall(token, "sendMessage", {
+            chat_id: chatId,
+            text: "I could not extract readable text from this file."
+          });
+          return;
+        }
+
+        const key = `rum1:lastText:${chatId}`;
+        await redis.set(key, cleaned);
+        await redis.expire(key, 60 * 60 * 2);
+
         await tgCall(token, "sendMessage", {
           chat_id: chatId,
-          text: "Please upload a PDF/DOCX/image OR paste the text first."
+          text:
+            "Text extracted and saved.\n\nNow send ONLY:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
         });
-        return res.status(200).json({ ok: true });
+        return;
       }
 
-      await tgCall(token, "sendMessage", { chat_id: chatId, text: "Translating..." });
+      // Plain text paste (store it)
+      if (update.message?.text) {
+        const text = update.message.text.trim();
+        const key = `rum1:lastText:${chatId}`;
+        await redis.set(key, text);
+        await redis.expire(key, 60 * 60 * 2);
 
-      const result = await translate(textToTranslate, direction, tone || "AUTO");
-      await sendLongMessage(token, chatId, result);
-
-      return res.status(200).json({ ok: true });
-    }
-
-    // 2) File upload (PDF/DOCX/Image)
-    if (update.message?.document || update.message?.photo) {
-      let fileId = "";
-      let mimeType = "";
-
-      if (update.message.document) {
-        fileId = update.message.document.file_id;
-        mimeType = update.message.document.mime_type || "";
-      } else {
-        fileId = update.message.photo[update.message.photo.length - 1].file_id;
-        mimeType = "image/jpeg";
-      }
-
-      await tgCall(token, "sendMessage", {
-        chat_id: chatId,
-        text: "File received. Extracting text..."
-      });
-
-      const buffer = await downloadFile(fileId, token);
-      const extractedText = await extractText(buffer, mimeType);
-      const cleaned = String(extractedText || "").trim();
-
-      if (!cleaned) {
         await tgCall(token, "sendMessage", {
           chat_id: chatId,
-          text: "I could not extract readable text from this file."
+          text:
+            "Text received and saved.\n\nNow send ONLY:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
         });
-        return res.status(200).json({ ok: true });
       }
-
-      const key = `rum1:lastText:${chatId}`;
-      await redis.set(key, cleaned);
-      await redis.expire(key, 60 * 60 * 2);
-
-      await tgCall(token, "sendMessage", {
-        chat_id: chatId,
-        text:
-          "Text extracted and saved.\n\nNow send ONLY:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
-      });
-
-      return res.status(200).json({ ok: true });
-    }
-
-    // 3) Plain text paste
-    if (update.message?.text) {
-      const text = update.message.text.trim();
-      const key = `rum1:lastText:${chatId}`;
-      await redis.set(key, text);
-      await redis.expire(key, 60 * 60 * 2);
-
-      await tgCall(token, "sendMessage", {
-        chat_id: chatId,
-        text:
-          "Text received and saved.\n\nNow send ONLY:\nDIR=EN2AR (or EL2AR, AR2EL, etc)\nTONE=LIT or TONE=ACAD"
-      });
-
-      return res.status(200).json({ ok: true });
-    }
-
-    return res.status(200).json({ ok: true });
+    })().catch(err => console.error("Worker error:", err));
   } catch (e) {
-    console.error(e);
-    // Still return 200 so Telegram doesn’t mark webhook as failing
-    return res.status(200).json({ ok: true });
+    console.error("Webhook error:", e);
+    try {
+      return res.status(200).json({ ok: true });
+    } catch {
+      return;
+    }
   }
 }
