@@ -40,7 +40,7 @@ async function downloadFile(fileId, token) {
   ).then(r => r.json());
 
   const filePath = fileInfo?.result?.file_path;
-  if (!filePath) throw new Error("Could not get file_path from Telegram.");
+  if (!filePath) throw new Error("Could not get file_path.");
 
   const fileUrl = `https://api.telegram.org/file/bot${token}/${filePath}`;
   const fileBuffer = await fetch(fileUrl).then(r => r.arrayBuffer());
@@ -90,39 +90,13 @@ function overrideKeyboard() {
   };
 }
 
-function buildSystemPrompt() {
-  return `System Prompt: Greek Orthodox Religious Translation Specialist
-ROLE DEFINITION: You are an expert theological translator specializing exclusively in the doctrines, liturgy, and literature of the Greek Orthodox Church. Your sole function is to translate religious texts from English and Greek into Arabic, and vise versa. You possess deep knowledge of Patristics, Byzantine theology, liturgical rubrics, and the specific Arabic terminology used by the Antiochian and broader Greek Orthodox traditions.
-CORE DIRECTIVES (NON-NEGOTIABLE):
-1. Doctrinal Fidelity: Every translation must align 100% with the dogma, spirit, and tradition of the Greek Orthodox Church. Any interpretation that leans toward Protestant, Catholic, secular, or modernist theological frameworks is strictly forbidden.
-2. Terminological Precision: You must use established, canonical Arabic Orthodox terminology. Do not invent new terms or use generic Islamic or secular Arabic words for theological concepts.
-o Example: Use "القداس الإلهي" for Divine Liturgy, not "العبادة".
-o Example: Use "الثيوتوكوس" or "والدة الإله" for Theotokos, avoiding ambiguous terms.
-o Example: Ensure distinctions between "essence" (ousia) and "energy" (energeia) are preserved accurately in Arabic.
-3. Source Integrity:
-o If translating from Greek: Preserve the nuance of the original Koine or Ecclesiastical Greek. Do not simplify complex theological syntax unless it obscures meaning in Arabic; prefer accuracy over readability if a conflict arises.
-o If translating from English: Recognize that the English source may already be a translation. You must mentally cross-reference the likely Greek original to ensure the Arabic reflects the Orthodox intent, correcting any Western theological drift present in the English source text.
-4. Tone and Style: The output must be reverent, formal, and liturgical (Fusha). It must sound as though it belongs in a church service or a patristic volume. Avoid colloquialisms, modern slang, or overly academic dryness that loses the spiritual warmth.
-OPERATIONAL CONSTRAINTS:
-• NO DEVIATION: Do not add commentary, personal opinions, footnotes explaining theology, or summaries unless explicitly requested. Output only the translation.
-• NO ECUMENICAL BLENDING: Do not harmonize terms with other Christian denominations or other religions. Stick strictly to the Greek Orthodox lexicon.
-• HANDLING AMBIGUITY: If a source phrase is ambiguous or potentially heretical from an Orthodox perspective, do not guess. Insert a bracketed note [TRANSLATOR NOTE: Potential doctrinal ambiguity in source regarding X] and provide the most orthodox interpretation possible based on context.
-• SCOPE LIMIT: If the input text is not religious or does not pertain to Greek Orthodox doctrine, refuse to translate and state: "${SCOPE_ERROR}"
-EXECUTION PROTOCOL: Upon receiving text:
-1. Analyze the theological context.
-2. Select the precise canonical Arabic equivalent for every theological term.
-3. Construct the sentence structure to reflect the gravity and rhythm of Orthodox Arabic literature.
-4. Review against the "Core Directives" one final time before outputting.
-BEGIN TRANSLATION TASK NOW. Await user input.`;
-}
-
 async function openaiTranslate({ text, direction, tone, allowOverride }) {
   const apiKey = mustGetEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   const enforcement = allowOverride
-    ? `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nTranslate anyway. Do NOT output "${SCOPE_ERROR}". Output only the translation.`
-    : `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nIf content is NOT Greek Orthodox religious text, output exactly:\n${SCOPE_ERROR}\nOtherwise output only the translation.`;
+    ? `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nTranslate anyway.`
+    : `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nIf content is NOT Greek Orthodox religious text, output exactly:\n${SCOPE_ERROR}`;
 
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -133,7 +107,7 @@ async function openaiTranslate({ text, direction, tone, allowOverride }) {
     body: JSON.stringify({
       model,
       input: [
-        { role: "system", content: buildSystemPrompt() },
+        { role: "system", content: "You are a strict Orthodox theological translator." },
         { role: "system", content: enforcement },
         { role: "user", content: text }
       ],
@@ -156,83 +130,18 @@ async function openaiTranslate({ text, direction, tone, allowOverride }) {
 
 async function translateWithProceedFlow({ chatId, token, direction, tone }) {
   const textKey = `rum1:lastText:${chatId}`;
-  const lastText = (await redis.get(textKey)) || "";
+  const lastText = await redis.get(textKey);
 
   if (!lastText) {
     await tgCall(token, "sendMessage", {
       chat_id: chatId,
-      text: "Please upload a PDF/DOCX/image OR paste the text first."
+      text: "Please upload a file or paste text first."
     });
     return;
   }
 
   await tgCall(token, "sendMessage", { chat_id: chatId, text: "Translating..." });
 
-  // Step A: Ask the model to classify quickly (Orthodox / uncertain / non-religious)
-  const apiKey = mustGetEnv("OPENAI_API_KEY");
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-  const classifyResp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "authorization": `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model,
-      input: [
-        {
-          role: "system",
-          content:
-            "You are a strict classifier. Return ONLY one label: ORTHODOX, UNCERTAIN, or OUT_OF_SCOPE."
-        },
-        {
-          role: "user",
-          content:
-            "Classify the following text for a Greek Orthodox theological translator:\n\n" +
-            lastText.slice(0, 8000)
-        }
-      ],
-      temperature: 0
-    })
-  });
-
-  const classifyData = await classifyResp.json();
-  if (!classifyResp.ok) throw new Error(JSON.stringify(classifyData));
-
-  const label = (classifyData.output || [])
-    .flatMap(o => o.content || [])
-    .filter(c => c.type === "output_text")
-    .map(c => c.text)
-    .join("\n")
-    .trim()
-    .toUpperCase();
-
-  // If clearly not religious: refuse
-  if (label.includes("OUT_OF_SCOPE")) {
-    await tgCall(token, "sendMessage", { chat_id: chatId, text: SCOPE_ERROR });
-    return;
-  }
-
-  // If uncertain: ask you Proceed/Overwrite (your requirement)
-  if (label.includes("UNCERTAIN")) {
-    const pendingKey = `rum1:pending:${chatId}`;
-    await redis.set(
-      pendingKey,
-      JSON.stringify({ direction, tone: tone || "AUTO", text: lastText })
-    );
-    await redis.expire(pendingKey, 60 * 30);
-
-    await tgCall(token, "sendMessage", {
-      chat_id: chatId,
-      text:
-        "Rum-1 is not fully sure this text is strictly Greek Orthodox in scope.\n\nProceed = translate anyway.\nOverwrite = discard and upload/paste new content.",
-      reply_markup: overrideKeyboard()
-    });
-    return;
-  }
-
-  // Step B: Normal translation (ORTHODOX)
   const result = await openaiTranslate({
     text: lastText,
     direction,
@@ -240,23 +149,115 @@ async function translateWithProceedFlow({ chatId, token, direction, tone }) {
     allowOverride: false
   });
 
-  // If the model still refuses, fall back to Proceed/Overwrite
   if (result.trim() === SCOPE_ERROR) {
     const pendingKey = `rum1:pending:${chatId}`;
     await redis.set(
       pendingKey,
-      JSON.stringify({ direction, tone: tone || "AUTO", text: lastText })
+      JSON.stringify({ direction, tone, text: lastText })
     );
-    await redis.expire(pendingKey, 60 * 30);
+    await redis.expire(pendingKey, 1800);
 
     await tgCall(token, "sendMessage", {
       chat_id: chatId,
       text:
-        "Rum-1 flagged a possible scope mismatch.\n\nProceed = translate anyway.\nOverwrite = discard and upload/paste new content.",
+        "Rum-1 flagged a possible scope mismatch.\n\nProceed = translate anyway.\nOverwrite = discard content.",
       reply_markup: overrideKeyboard()
     });
     return;
   }
 
   await sendLongMessage(token, chatId, result);
+}
+
+export default async function handler(req, res) {
+  try {
+    const token = mustGetEnv("TELEGRAM_BOT_TOKEN");
+
+    if (req.body.callback_query) {
+      const cq = req.body.callback_query;
+      const chatId = cq.message.chat.id;
+      const pendingKey = `rum1:pending:${chatId}`;
+
+      const raw = await redis.get(pendingKey);
+      const pending =
+        typeof raw === "string" ? JSON.parse(raw) : raw;
+
+      if (!pending) {
+        await tgCall(token, "sendMessage", {
+          chat_id: chatId,
+          text: "No pending translation found."
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      if (cq.data === "OVR:PROCEED") {
+        const result = await openaiTranslate({
+          text: pending.text,
+          direction: pending.direction,
+          tone: pending.tone,
+          allowOverride: true
+        });
+
+        await redis.del(pendingKey);
+        await sendLongMessage(token, chatId, result);
+      }
+
+      if (cq.data === "OVR:OVERWRITE") {
+        await redis.del(pendingKey);
+        await tgCall(token, "sendMessage", {
+          chat_id: chatId,
+          text: "Content discarded. Upload or paste new text."
+        });
+      }
+
+      return res.status(200).json({ ok: true });
+    }
+
+    const message = req.body.message;
+    if (!message) return res.status(200).json({ ok: true });
+
+    const chatId = message.chat.id;
+
+    if (message.document) {
+      const fileBuffer = await downloadFile(
+        message.document.file_id,
+        token
+      );
+
+      const text = await extractText(
+        fileBuffer,
+        message.document.mime_type
+      );
+
+      await redis.set(`rum1:lastText:${chatId}`, text);
+
+      await tgCall(token, "sendMessage", {
+        chat_id: chatId,
+        text:
+          "File received.\n\nNow send:\nDIR=EN2AR\nTONE=LIT or TONE=ACAD"
+      });
+
+      return res.status(200).json({ ok: true });
+    }
+
+    if (message.text) {
+      const { direction, tone } = parseDirTone(message.text);
+
+      if (direction) {
+        await translateWithProceedFlow({
+          chatId,
+          token,
+          direction,
+          tone
+        });
+      } else {
+        await redis.set(`rum1:lastText:${chatId}`, message.text);
+      }
+    }
+
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(200).json({ ok: true });
+  }
 }
