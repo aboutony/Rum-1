@@ -204,6 +204,7 @@ export default async function handler(req, res) {
 
   (async () => {
     const update = req.body || {};
+    await tgCall(token, "sendMessage", { chat_id: (update?.message?.chat?.id || update?.callback_query?.message?.chat?.id), text: "Rum-1 is alive ✅" });
 
     // Handle button clicks
     if (update.callback_query) {
