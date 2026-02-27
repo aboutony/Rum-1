@@ -90,24 +90,47 @@ function overrideKeyboard() {
   };
 }
 
+function looksLikeRefusal(text) {
+  const t = String(text || "").toLowerCase();
+  return (
+    t.includes("i'm sorry") ||
+    t.includes("i am sorry") ||
+    t.includes("can't assist") ||
+    t.includes("cannot assist") ||
+    t.includes("unable to assist") ||
+    t.includes("unable to help")
+  );
+}
+
 async function openaiTranslate({ text, direction, tone, allowOverride }) {
   const apiKey = mustGetEnv("OPENAI_API_KEY");
   const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   const enforcement = allowOverride
-    ? `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nTranslate anyway.`
-    : `Direction: ${direction}\nTone: ${tone || "AUTO"}\n\nIf content is NOT Greek Orthodox religious text, output exactly:\n${SCOPE_ERROR}`;
+    ? `Direction: ${direction}
+Tone: ${tone || "AUTO"}
+
+This is a TRANSLATION request of a religious/theological text.
+Translate neutrally and faithfully.
+Do not add advice or commentary.
+Output ONLY the translation.`
+    : `Direction: ${direction}
+Tone: ${tone || "AUTO"}
+
+If content is NOT Greek Orthodox religious text, output exactly:
+${SCOPE_ERROR}
+Otherwise output ONLY the translation.`;
 
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "authorization": `Bearer ${apiKey}`
+      authorization: `Bearer ${apiKey}`
     },
     body: JSON.stringify({
       model,
       input: [
-        { role: "system", content: "You are a strict Orthodox theological translator." },
+        { role: "system", content: "You are a theological translator." },
         { role: "system", content: enforcement },
         { role: "user", content: text }
       ],
@@ -125,7 +148,46 @@ async function openaiTranslate({ text, direction, tone, allowOverride }) {
     .join("\n")
     .trim();
 
-  return out || "Error: Empty output.";
+  let finalOut = out || "Error: Empty output.";
+
+  // Retry once if model refuses
+  if (allowOverride && looksLikeRefusal(finalOut)) {
+    const retry = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        input: [
+          {
+            role: "system",
+            content:
+              "This is strictly a translation task. Translate faithfully. No commentary."
+          },
+          { role: "user", content: text }
+        ],
+        temperature: 0
+      })
+    });
+
+    const retryData = await retry.json();
+    if (retry.ok) {
+      const retryOut = (retryData.output || [])
+        .flatMap(o => o.content || [])
+        .filter(c => c.type === "output_text")
+        .map(c => c.text)
+        .join("\n")
+        .trim();
+
+      if (retryOut && !looksLikeRefusal(retryOut)) {
+        finalOut = retryOut;
+      }
+    }
+  }
+
+  return finalOut;
 }
 
 async function translateWithProceedFlow({ chatId, token, direction, tone }) {
